@@ -1,7 +1,9 @@
 // src/views/WebNotesView.tsx
-import React, { useState, useMemo } from 'react';
-import { Search, ChevronDown, Book, ShieldAlert, X, Volume2, Database } from 'lucide-react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { Search, ChevronDown, Book, ShieldAlert, X, Volume2, Database, Download, Tag, ChevronLeft, ChevronRight } from 'lucide-react';
 import { AsyncImage, AsyncAudio } from '../components/WebShared';
+import { WebDriveService } from '../services/WebDriveService';
+import { WebTaxonomyService, type TaxonInfo } from '../services/WebTaxonomyService';
 
 interface NoteNode {
     pathStr: string;
@@ -23,6 +25,14 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
     const [searchQuery, setSearchQuery] = useState('');
     const [viewingData, setViewingData] = useState<any | null>(null);
     const [collapsedNotePaths, setCollapsedNotePaths] = useState<Set<string>>(new Set());
+    
+    // 多圖切換狀態
+    const [currentImageIndex, setCurrentImageIndex] = useState(0);
+
+    // TaiCOL API 與下載狀態
+    const [taicolData, setTaicolData] = useState<TaxonInfo | null>(null);
+    const [isTaicolLoading, setIsTaicolLoading] = useState(false);
+    const [downloadingAudioId, setDownloadingAudioId] = useState<string | null>(null);
 
     const filteredNotes = useMemo(() => {
         if (!searchQuery.trim()) return notes;
@@ -38,9 +48,56 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
         return map;
     }, [typeof tags !== 'undefined' ? tags : []]);
 
+    useEffect(() => {
+        setCurrentImageIndex(0);
+    }, [viewingData]);
+
+    useEffect(() => {
+        if (!viewingData) {
+            setTaicolData(null);
+            return;
+        }
+
+        let isMounted = true;
+        const fetchTaicol = async () => {
+            setIsTaicolLoading(true);
+            try {
+                const queryName = viewingData.scientificName || viewingData.speciesName;
+                if (!queryName) {
+                    if (isMounted) setTaicolData(null);
+                    return;
+                }
+
+                const { taxMap } = await WebTaxonomyService.batchGetTaxonomy([queryName]);
+                const data = taxMap.get(queryName);
+                
+                if (isMounted && data && (data.kingdom || data.family || data.genus)) {
+                    setTaicolData(data);
+                } else if (viewingData.scientificName && viewingData.speciesName) {
+                    const { taxMap: fbMap } = await WebTaxonomyService.batchGetTaxonomy([viewingData.speciesName]);
+                    const fbData = fbMap.get(viewingData.speciesName);
+                    if (isMounted && fbData && (fbData.kingdom || fbData.family || fbData.genus)) {
+                        setTaicolData(fbData);
+                    } else {
+                        if (isMounted) setTaicolData(null);
+                    }
+                } else {
+                    if (isMounted) setTaicolData(null);
+                }
+            } catch (e) {
+                console.warn("TaiCOL API 查詢失敗:", e);
+                if (isMounted) setTaicolData(null);
+            } finally {
+                if (isMounted) setIsTaicolLoading(false);
+            }
+        };
+
+        fetchTaicol();
+        return () => { isMounted = false; };
+    }, [viewingData]);
+
     const noteTree = useMemo(() => {
         const root: NoteNode[] = [];
-
         filteredNotes.forEach(note => {
             let currentTags = note.tags && Array.isArray(note.tags) ? note.tags : [];
             let path: string[] = [];
@@ -55,7 +112,6 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
                     curr = tagMap.get(curr.parentId);
                 }
             }
-            
             if (path.length === 0) path = ['未分類'];
 
             let currentLevelList = root;
@@ -64,25 +120,13 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
             for (let i = 0; i < path.length; i++) {
                 const part = path[i];
                 currentPathStr = currentPathStr ? `${currentPathStr}/${part}` : part;
-                
                 let node = currentLevelList.find(n => n.title === part);
                 if (!node) {
-                    node = {
-                        pathStr: currentPathStr,
-                        title: part,
-                        level: i,
-                        notes: [],
-                        children: [],
-                        totalNotes: 0
-                    };
+                    node = { pathStr: currentPathStr, title: part, level: i, notes: [], children: [], totalNotes: 0 };
                     currentLevelList.push(node);
                 }
                 node.totalNotes += 1;
-                
-                if (i === path.length - 1) {
-                    node.notes.push(note);
-                }
-                
+                if (i === path.length - 1) node.notes.push(note);
                 currentLevelList = node.children;
             }
         });
@@ -104,6 +148,52 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
         const s = new Set(collapsedNotePaths);
         if (s.has(pathStr)) s.delete(pathStr); else s.add(pathStr);
         setCollapsedNotePaths(s);
+    };
+
+    const handleDownloadAudio = async (rec: any, e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (downloadingAudioId) return;
+        
+        setDownloadingAudioId(rec.id);
+        try {
+            let downloadUrl = '';
+            const mime = rec.mimeType || 'audio/wav';
+
+            if (rec.base64) {
+                downloadUrl = rec.base64.startsWith('data:') 
+                    ? rec.base64 
+                    : `data:${mime};base64,${rec.base64}`;
+            } else {
+                const path = rec.filePath || rec.localPath || rec.fileName || rec.path;
+                const fetchedUrl = await WebDriveService.getMediaBlobUrl(path, mime, false, rec.id);
+                if (fetchedUrl) downloadUrl = fetchedUrl;
+            }
+            
+            if (downloadUrl) {
+                // ★ 智慧副檔名判斷：優先看檔名，否則以 mimeType 判斷
+                let ext = 'wav'; 
+                if (rec.fileName && rec.fileName.includes('.')) {
+                    ext = rec.fileName.split('.').pop()?.toLowerCase() || 'wav';
+                } else if (mime) {
+                    if (mime.includes('mp4') || mime.includes('m4a') || mime.includes('aac')) ext = 'm4a';
+                    else if (mime.includes('mpeg') || mime.includes('mp3')) ext = 'mp3';
+                }
+
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = `MyEcoNotes_Audio_${rec.id.substring(0, 8)}.${ext}`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            } else {
+                alert('無法取得音檔下載連結，請確認 App 端是否已成功上傳。');
+            }
+        } catch (err) {
+            console.error('音檔下載失敗', err);
+            alert('音檔下載失敗，請確認網路連線');
+        } finally {
+            setDownloadingAudioId(null);
+        }
     };
 
     const renderNoteTree = (nodes: NoteNode[]) => {
@@ -168,6 +258,7 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
         }
 
         const data = viewingData;
+        const noteTags = (data.tags || []).map((tId: string) => tagMap.get(tId)).filter(Boolean);
         
         return (
             <div className="flex flex-col h-full relative animate-in slide-in-from-right-4 duration-300">
@@ -180,39 +271,90 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
                     </button>
                 </div>
                 
-                <div className="flex-1 overflow-y-auto p-6 bg-white dark:bg-stone-950 custom-scrollbar relative overflow-x-hidden flex flex-col">
-                    <div className="max-w-2xl mx-auto space-y-6 w-full">
-                        <div className="flex gap-4 items-start bg-emerald-50 dark:bg-emerald-900/10 p-6 rounded-2xl border border-emerald-100 dark:border-emerald-900/50">
-                            {data.images && data.images.length > 0 ? (
-                                <div className="w-24 h-24 rounded-xl overflow-hidden shadow-sm shrink-0 border-2 border-white dark:border-stone-800">
-                                    <AsyncImage srcPath={data.images[0]} />
-                                </div>
-                            ) : (
-                                <div className="w-24 h-24 rounded-xl bg-white dark:bg-stone-800 flex items-center justify-center text-stone-300 shrink-0 shadow-sm border border-stone-100 dark:border-stone-700">
-                                    <Book size={32} />
-                                </div>
+                <div className="bg-indigo-50/50 dark:bg-indigo-900/20 border-b border-indigo-100 dark:border-indigo-900/50 px-6 py-5 shrink-0 z-10">
+                    <div className="flex flex-wrap items-baseline gap-3 mb-2">
+                        <h3 className="text-2xl font-black text-stone-800 dark:text-stone-100">{data.speciesName}</h3>
+                        {data.scientificName && <span className="text-[15px] italic text-stone-500">{data.scientificName}</span>}
+                        
+                        <div className="flex flex-wrap gap-2 items-center ml-auto md:ml-0 mt-2 md:mt-0">
+                            {data.conservationStatus && data.conservationStatus !== 'N' && (
+                                <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400 rounded-md border border-red-200 dark:border-red-800/50 shadow-sm">
+                                    <ShieldAlert size={12}/> 保育等級: {data.conservationStatus}
+                                </span>
                             )}
-                            <div>
-                                <h3 className="text-3xl font-black text-stone-800 dark:text-stone-100">{data.speciesName}</h3>
-                                <p className="text-stone-500 italic text-sm mt-1">{data.scientificName}</p>
-                                <div className="flex gap-2 mt-3">
-                                    {data.conservationStatus && data.conservationStatus !== 'N' && (
-                                        <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-1 bg-red-100 text-red-700 rounded"><ShieldAlert size={12}/> 保育: {data.conservationStatus}</span>
-                                    )}
-                                </div>
-                            </div>
+                            {noteTags.map((t: any) => (
+                                <span key={t.id} className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 rounded-md border border-blue-200 dark:border-blue-800/50 shadow-sm">
+                                    <Tag size={12}/> {t.name || t.label}
+                                </span>
+                            ))}
                         </div>
+                    </div>
+
+                    <div className="text-[13px] text-stone-500 font-medium flex flex-wrap gap-1 items-center mt-2">
+                        {isTaicolLoading ? (
+                            <span className="flex items-center gap-2 text-indigo-500"><Database size={13} className="animate-spin" /> 查詢 TaiCOL 資訊中...</span>
+                        ) : taicolData ? (
+                            <span>
+                                {taicolData.kingdom_c} &gt; {taicolData.phylum_c} &gt; {taicolData.class_c} &gt; {taicolData.order_c} &gt; {taicolData.family_c} &gt; {taicolData.genus_c}
+                            </span>
+                        ) : null}
+                    </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 md:p-6 bg-white dark:bg-stone-950 custom-scrollbar relative overflow-x-hidden flex flex-col">
+                    <div className="max-w-3xl mx-auto space-y-6 w-full pb-10">
+                        
+                        {data.images && data.images.length > 0 && (
+                            <div className="w-full h-64 md:h-80 lg:h-96 rounded-2xl overflow-hidden shadow-sm border border-stone-200 dark:border-stone-800 bg-stone-100 dark:bg-stone-900 shrink-0 relative group flex items-center justify-center">
+                                <AsyncImage srcPath={data.images[currentImageIndex]} className="w-full h-full object-contain" />
+                                
+                                {data.images.length > 1 && (
+                                    <>
+                                        <button 
+                                            onClick={(e) => { e.stopPropagation(); setCurrentImageIndex(prev => prev > 0 ? prev - 1 : data.images.length - 1); }}
+                                            className="absolute left-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 text-white rounded-full hover:bg-black/70 opacity-0 group-hover:opacity-100 transition-all shadow-md z-10"
+                                        >
+                                            <ChevronLeft size={24} />
+                                        </button>
+                                        <button 
+                                            onClick={(e) => { e.stopPropagation(); setCurrentImageIndex(prev => prev < data.images.length - 1 ? prev + 1 : 0); }}
+                                            className="absolute right-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 text-white rounded-full hover:bg-black/70 opacity-0 group-hover:opacity-100 transition-all shadow-md z-10"
+                                        >
+                                            <ChevronRight size={24} />
+                                        </button>
+                                        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 bg-black/50 backdrop-blur-md text-white text-xs font-bold rounded-full shadow-md z-10">
+                                            {currentImageIndex + 1} / {data.images.length}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
 
                         {data.recordings && data.recordings.length > 0 && (
                             <div className="space-y-3">
                                 <h4 className="text-sm font-bold text-stone-500 uppercase tracking-wider px-2 flex items-center gap-2"><Volume2 size={16}/> 聲音紀錄</h4>
                                 {data.recordings.map((rec: any) => (
-                                    <div key={rec.id} className="p-3 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl flex items-center gap-3">
-                                        <AsyncAudio recording={rec} />
-                                        <div>
-                                            <div className="text-sm font-bold text-stone-800 dark:text-stone-100">錄音檔 {rec.id.substring(0,6)}</div>
-                                            <div className="text-[10px] text-stone-500">{(rec.duration || 0).toFixed(1)}s • {new Date(rec.timestamp).toLocaleString()}</div>
+                                    <div key={rec.id} className="p-3 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl flex items-center justify-between gap-4 shadow-sm transition-all hover:border-emerald-300 dark:hover:border-emerald-700">
+                                        <div className="flex items-center gap-4 min-w-0 flex-1 overflow-hidden">
+                                            <AsyncAudio recording={rec} />
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-sm font-bold text-stone-800 dark:text-stone-100 truncate">錄音檔 {rec.id.substring(0,8)}</div>
+                                                <div className="text-xs text-stone-500 mt-0.5">{(rec.duration || 0).toFixed(1)}s • {new Date(rec.timestamp).toLocaleString()}</div>
+                                            </div>
                                         </div>
+                                        <button 
+                                            onClick={(e) => handleDownloadAudio(rec, e)} 
+                                            disabled={downloadingAudioId === rec.id}
+                                            className={`p-2.5 rounded-xl transition-all shrink-0 border shadow-sm flex items-center gap-1.5 ${
+                                                downloadingAudioId === rec.id 
+                                                ? 'bg-stone-100 text-stone-400 border-stone-200 cursor-not-allowed' 
+                                                : 'bg-stone-50 hover:bg-emerald-50 text-stone-500 hover:text-emerald-600 dark:bg-stone-800 dark:hover:bg-emerald-900/30 border-stone-200 dark:border-stone-700'
+                                            }`}
+                                            title="下載音檔"
+                                        >
+                                            {downloadingAudioId === rec.id ? <Database size={18} className="animate-spin" /> : <Download size={18} />}
+                                            <span className="text-xs font-bold hidden sm:inline">{downloadingAudioId === rec.id ? '下載中...' : '下載'}</span>
+                                        </button>
                                     </div>
                                 ))}
                             </div>
@@ -257,7 +399,7 @@ export const WebNotesView: React.FC<Props> = ({ notes, tags, isLoading, statusMs
                 </div>
             </main>
 
-            <section className="flex-1 min-w-0 bg-white dark:bg-stone-950 relative">
+            <section className="flex-1 min-w-0 bg-white dark:bg-stone-950 relative flex flex-col">
                 {renderDetailPane()}
             </section>
         </>
